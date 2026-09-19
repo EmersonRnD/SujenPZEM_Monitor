@@ -1,81 +1,36 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PZEM-017 Mobile BLE Monitor</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #fff; text-align: center; padding: 16px; margin: 0; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; max-width: 480px; margin: 15px auto; }
-    .card { background: #1e1e1e; border-radius: 8px; padding: 16px; border: 1px solid #333; }
-    .val { font-size: 1.8rem; font-weight: bold; color: #00d2ff; margin-top: 6px; }
-    .status-bar { max-width: 480px; margin: 12px auto; display: flex; justify-content: space-between; font-size: 0.85rem; color: #aaa; }
-    button { padding: 12px 16px; font-size: 0.95rem; border-radius: 6px; border: none; cursor: pointer; font-weight: 600; margin: 4px; }
-    button.primary { background: #00d2ff; color: #000; width: 100%; }
-    button.export { background: #03dac6; color: #000; width: 48%; }
-    button.danger { background: #cf6679; color: #000; width: 48%; }
-    .btn-group { display: flex; justify-content: space-between; max-width: 480px; margin: 10px auto; }
-    #debug { margin-top: 20px; font-family: monospace; font-size: 0.75rem; color: #777; word-break: break-all; }
-  </style>
-</head>
-<body>
-
-  <h3>PZEM-017 Mobile BLE Telemetry</h3>
-
-  <div style="max-width: 480px; margin: 0 auto;">
-    <button id="btnConnect" class="primary">Connect SH-B20 via Bluetooth</button>
-  </div>
-
-  <div class="btn-group">
-    <button id="btnExportLogs" class="export">Download CSV</button>
-    <button id="btnClearLogs" class="danger">Clear Buffer</button>
-  </div>
-
-  <div class="status-bar">
-    <span id="logStatus">Buffer: 0 rows (Paused)</span>
-    <span id="timerStatus">Next Log: --</span>
-  </div>
-
-  <div class="grid">
-    <div class="card"><div>Voltage</div><div class="val" id="v">-- V</div></div>
-    <div class="card"><div>Current</div><div class="val" id="i">-- A</div></div>
-    <div class="card"><div>Power</div><div class="val" id="p">-- W</div></div>
-    <div class="card"><div>Total Energy</div><div class="val" id="e">-- Wh</div></div>
-  </div>
-
-  <div id="debug">Ready for BLE pairing. Use Chrome on Android with Location/Bluetooth enabled.</div>
-
-  <script>
-    const BLE_SERVICE_UUID = 0xFFE0;
-    const BLE_CHAR_UUID    = 0xFFE1;
-
-    let bleDevice, bleServer, bleChar;
-    let pollInterval, logInterval;
-    let secondsToNextLog = 15;
-    let rxBuffer = [];
-
-    // Modbus RTU Read (0x01, FC 0x04, Regs 0x0000-0x0007)
-    const reqFrame = new Uint8Array([0x01, 0x04, 0x00, 0x00, 0x00, 0x08, 0xF1, 0xCC]);
-    // 300A Calibration Frame
-    const shuntFrame300A = new Uint8Array([0x01, 0x06, 0x00, 0x03, 0x00, 0x03, 0x39, 0xCB]);
-
-    const CSV_HEADER = "Timestamp_UTC_ISO8601,DC_Bus_Voltage_V,DC_Shunt_Current_A,DC_Input_Power_W,Cumulative_Energy_Wh,Calculated_Impedance_Ohm,Logging_State\n";
-    let csvData = CSV_HEADER;
-    let logRowCount = 0;
-
-    let telemetry = { v: null, i: null, p: null, e: null, lastValidTime: 0 };
-
-    document.getElementById('btnConnect').onclick = async () => {
+document.getElementById('btnConnect').onclick = async () => {
       try {
-        document.getElementById('debug').innerText = "Requesting Bluetooth device...";
-        bleDevice = await navigator.bluetooth.requestDevice({
-          filters: [{ namePrefix: 'DSD' }, { namePrefix: 'SH' }, { namePrefix: 'BT' }],
-          optionalServices: [BLE_SERVICE_UUID]
-        });
+        document.getElementById('debug').innerText = "Checking existing permissions...";
+
+        // 1. Check if the device was previously authorized in Chrome
+        if (navigator.bluetooth.getDevices) {
+          const pairedDevices = await navigator.bluetooth.getDevices();
+          if (pairedDevices.length > 0) {
+            bleDevice = pairedDevices[0];
+            document.getElementById('debug').innerText = "Reconnecting to known device: " + (bleDevice.name || "BLE Adapter");
+          }
+        }
+
+        // 2. If not previously authorized, open the native scanner without restrictive filters
+        if (!bleDevice) {
+          document.getElementById('debug').innerText = "Scanning for all BLE devices...";
+          bleDevice = await navigator.bluetooth.requestDevice({
+            acceptAllDevices: true,
+            optionalServices: [BLE_SERVICE_UUID, 0xFFE0, 0xFFE1, "0000ffe0-0000-1000-8000-00805f9b34fb"]
+          });
+        }
 
         document.getElementById('debug').innerText = "Connecting to GATT Server...";
-        bleServer = await bleDevice.gatt.connect();
+        
+        // Timeout guard to stop infinite spinning
+        const connectTimeout = setTimeout(() => {
+          throw new Error("GATT Connection timed out. Ensure device is unpaired from Android system settings.");
+        }, 10000);
 
+        bleServer = await bleDevice.gatt.connect();
+        clearTimeout(connectTimeout);
+
+        document.getElementById('debug').innerText = "Discovering services...";
         const service = await bleServer.getPrimaryService(BLE_SERVICE_UUID);
         bleChar = await service.getCharacteristic(BLE_CHAR_UUID);
 
@@ -83,7 +38,7 @@
         await bleChar.startNotifications();
         bleChar.addEventListener('characteristicvaluechanged', handleNotifications);
 
-        document.getElementById('btnConnect').innerText = "Connected: " + bleDevice.name;
+        document.getElementById('btnConnect').innerText = "Connected: " + (bleDevice.name || "SH-B20");
         document.getElementById('btnConnect').style.background = "#03dac6";
 
         // Assert 300A shunt register
@@ -92,111 +47,19 @@
         // Start 1-second polling loop
         clearInterval(pollInterval);
         pollInterval = setInterval(async () => {
-          if (bleChar && bleServer.connected) {
-            await bleChar.writeValueWithoutResponse(reqFrame);
+          if (bleChar && bleServer && bleServer.connected) {
+            try {
+              await bleChar.writeValueWithoutResponse(reqFrame);
+            } catch (e) {
+              console.warn("Poll write dropped:", e);
+            }
           }
         }, 1000);
 
         initLoggingTimer();
       } catch (err) {
+        bleDevice = null;
         document.getElementById('debug').innerText = "BLE Error: " + err.message;
+        console.error(err);
       }
     };
-
-    function handleNotifications(event) {
-      const val = event.target.value;
-      for (let i = 0; i < val.byteLength; i++) {
-        rxBuffer.push(val.getUint8(i));
-      }
-
-      while (rxBuffer.length >= 21) {
-        if (rxBuffer[0] === 0x01 && rxBuffer[1] === 0x04 && rxBuffer[2] === 0x10) {
-          const frame = rxBuffer.slice(0, 21);
-          rxBuffer = rxBuffer.slice(21);
-
-          document.getElementById('debug').innerText = 
-            'Frame: ' + frame.map(x => x.toString(16).padStart(2, '0').toUpperCase()).join(' ');
-
-          const rawV = (frame[3] << 8) | frame[4];
-          const rawI = (frame[5] << 8) | frame[6];
-          const rawP = ((frame[9] << 8) | frame[10]) << 16 | ((frame[7] << 8) | frame[8]);
-          const rawE = ((frame[13] << 8) | frame[14]) << 16 | ((frame[11] << 8) | frame[12]);
-
-          telemetry.v = rawV * 0.01;
-          telemetry.i = rawI * 0.01;
-          telemetry.p = rawP * 0.1;
-          telemetry.e = rawE;
-          telemetry.lastValidTime = Date.now();
-
-          document.getElementById('v').innerText = telemetry.v.toFixed(2) + ' V';
-          document.getElementById('i').innerText = telemetry.i.toFixed(2) + ' A';
-          document.getElementById('p').innerText = telemetry.p.toFixed(1) + ' W';
-          document.getElementById('e').innerText = telemetry.e + ' Wh';
-        } else {
-          rxBuffer.shift();
-        }
-      }
-    }
-
-    function resetLiveTelemetryDisplay() {
-      telemetry.v = 0.00;
-      telemetry.i = 0.00;
-      telemetry.p = 0.0;
-      document.getElementById('v').innerText = '0.00 V';
-      document.getElementById('i').innerText = '0.00 A';
-      document.getElementById('p').innerText = '0.0 W';
-    }
-
-    function initLoggingTimer() {
-      clearInterval(logInterval);
-      secondsToNextLog = 15;
-      logInterval = setInterval(() => {
-        secondsToNextLog--;
-        if (secondsToNextLog <= 0) {
-          recordTelemetry();
-          secondsToNextLog = 15;
-        }
-        document.getElementById('timerStatus').innerText = `Next Log: ${secondsToNextLog}s`;
-      }, 1000);
-    }
-
-    function recordTelemetry() {
-      const now = Date.now();
-      const hasRecentData = (now - telemetry.lastValidTime < 3000);
-      const isVoltagePresent = telemetry.v !== null && telemetry.v > 0.05;
-
-      if (!hasRecentData || !isVoltagePresent) {
-        resetLiveTelemetryDisplay();
-        document.getElementById('logStatus').innerText = `Buffer: ${logRowCount} rows (No Voltage)`;
-        return;
-      }
-
-      const isoUtc = new Date(now).toISOString();
-      const rCalc = telemetry.i > 0.005 ? (telemetry.v / telemetry.i).toFixed(3) : "OPEN";
-      const row = `${isoUtc},${telemetry.v.toFixed(2)},${telemetry.i.toFixed(2)},${telemetry.p.toFixed(1)},${telemetry.e !== null ? telemetry.e : 0},${rCalc},NORMAL_ACQUISITION\n`;
-
-      csvData += row;
-      logRowCount++;
-      document.getElementById('logStatus').innerText = `Buffer: ${logRowCount} rows (Active)`;
-    }
-
-    document.getElementById('btnExportLogs').onclick = () => {
-      const blob = new Blob([csvData], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `pzem_telemetry_${Date.now()}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    };
-
-    document.getElementById('btnClearLogs').onclick = () => {
-      csvData = CSV_HEADER;
-      logRowCount = 0;
-      document.getElementById('logStatus').innerText = "Buffer: 0 rows (Reset)";
-    };
-  </script>
-</body>
-</html>
